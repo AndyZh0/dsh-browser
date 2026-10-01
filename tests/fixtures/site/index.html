@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dsh-browser fixture</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; }
+  #hoverTarget { padding: 8px; border: 1px dashed #888; width: 220px; }
+  #hoverTarget:hover { background: #dff; }
+  .dropzone { width: 220px; height: 70px; border: 2px dashed #999; display: flex; align-items: center; justify-content: center; }
+  .dropzone.over { border-color: #06f; background: #eef; }
+  #draggable { padding: 10px; background: #ffe; border: 1px solid #cc9; cursor: grab; width: 160px; }
+  .tall { height: 1400px; background: linear-gradient(#fff, #dde); }
+  button, input { font: inherit; padding: 6px 10px; }
+</style>
+</head>
+<body>
+  <h1 id="heading">dsh-browser fixture</h1>
+  <p id="intro">A page for exercising the browser tools.</p>
+
+  <section>
+    <h2>Click</h2>
+    <button id="counter" type="button">Clicked 0 times</button>
+  </section>
+
+  <section>
+    <h2>Type</h2>
+    <label for="field">Your name</label>
+    <input id="field" name="field" type="text" placeholder="type here">
+    <button id="echo" type="button">Echo</button>
+    <p id="echoed" aria-live="polite"></p>
+  </section>
+
+  <section>
+    <h2>Hover</h2>
+    <div id="hoverTarget">Hover me</div>
+    <p id="hovered">not hovered</p>
+  </section>
+
+  <section>
+    <h2>Drag</h2>
+    <div id="draggable" draggable="true">drag me</div>
+    <div id="dropzone" class="dropzone">drop here</div>
+    <p id="dropped">nothing dropped</p>
+  </section>
+
+  <section>
+    <h2>Dialog</h2>
+    <button id="askConfirm" type="button">Ask confirm</button>
+    <p id="confirmResult">no answer yet</p>
+  </section>
+
+  <div class="tall"><h2 id="bottom">Bottom of a tall page</h2></div>
+
+<script>
+  let clicks = 0;
+  const counter = document.getElementById('counter');
+  counter.addEventListener('click', () => { clicks += 1; counter.textContent = 'Clicked ' + clicks + ' times'; });
+
+  document.getElementById('echo').addEventListener('click', () => {
+    document.getElementById('echoed').textContent = 'echo: ' + document.getElementById('field').value;
+  });
+
+  const hoverTarget = document.getElementById('hoverTarget');
+  hoverTarget.addEventListener('mouseenter', () => { document.getElementById('hovered').textContent = 'hovered'; });
+  hoverTarget.addEventListener('mouseleave', () => { document.getElementById('hovered').textContent = 'not hovered'; });
+
+  const dropzone = document.getElementById('dropzone');
+  dropzone.addEventListener('dragover', (event) => { event.preventDefault(); dropzone.classList.add('over'); });
+  dropzone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropzone.classList.remove('over');
+    document.getElementById('dropped').textContent = 'dropped';
+  });
+
+  document.getElementById('askConfirm').addEventListener('click', () => {
+    const answer = window.confirm('Proceed with the fixture?');
+    document.getElementById('confirmResult').textContent = 'answer: ' + String(answer);
+  });
+</script>
+</body>
+</html>

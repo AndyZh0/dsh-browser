@@ -1,0 +1,10 @@
+# Installed dependencies, including the junctions this plugin uses to resolve the
+# adjacent checkout's packages while developing outside the workspace.
+node_modules/
+
+# Build output. package.json's "files" list still ships lib/ inside the archive;
+# this rule only keeps it out of git.
+lib/
+
+# Archives produced by `npm pack`.
+*.tgz

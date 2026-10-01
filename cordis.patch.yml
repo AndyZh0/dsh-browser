@@ -1,0 +1,8 @@
+# The dsh-browser bundle patch.
+#
+# The row id deliberately differs from the package name: a stale profile patch in
+# a pre-existing installation already targets an older "dsh-browser" row with
+# channel/userDataDir config this plugin does not declare.
+- insert:
+    - id: dsh-browser-model
+      name: dsh-browser
