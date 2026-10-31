@@ -31,6 +31,13 @@ interface PendingCommand {
   operationTimer: NodeJS.Timeout | undefined
 }
 
+/** One registered polling renderer and the surface it announced. */
+interface ClientRecord {
+  seen: number
+  /** Whether the renderer exposes the Desktop browser guest this plugin drives. */
+  desktop: boolean
+}
+
 interface Waiter {
   readonly deliver: (command: BrowserCommand) => void
   readonly close: () => void
@@ -47,7 +54,7 @@ export class BrowserHostSession {
   private readonly queue: BrowserCommand[] = []
   private readonly pending = new Map<string, PendingCommand>()
   private readonly waiters = new Set<Waiter>()
-  private readonly clients = new Map<string, number>()
+  private readonly clients = new Map<string, ClientRecord>()
   private admitting = true
   private disposed = false
 
@@ -65,8 +72,11 @@ export class BrowserHostSession {
       lingerMs: this.config.lingerMs,
       maxReadChars: this.config.maxReadChars,
       maxOutputChars: this.config.maxOutputChars,
+      operationTimeoutMs: this.config.operationTimeoutMs,
       codeTimeoutMs: this.config.codeTimeoutMs,
       maxFullPageTiles: this.config.maxFullPageTiles,
+      backgroundCaptureWidth: this.config.backgroundCaptureWidth,
+      backgroundCaptureHeight: this.config.backgroundCaptureHeight,
     }
   }
 
@@ -76,7 +86,19 @@ export class BrowserHostSession {
    */
   hello(payload: unknown): void {
     const clientId = readClientId(payload)
-    this.clients.set(clientId, Date.now())
+    this.clients.set(clientId, { seen: Date.now(), desktop: readDesktop(payload) })
+  }
+
+  /** Refresh one polling Client without discarding the surface it announced. */
+  private observeClient(clientId: string): void {
+    const known = this.clients.get(clientId)
+    this.clients.set(clientId, { seen: Date.now(), desktop: known?.desktop ?? false })
+  }
+
+  /** Whether any polling renderer announced the Desktop browser guest. */
+  private hasDesktopClient(): boolean {
+    for (const client of this.clients.values()) if (client.desktop) return true
+    return false
   }
 
   /**
@@ -87,7 +109,7 @@ export class BrowserHostSession {
    */
   async poll(payload: unknown, signal: AbortSignal): Promise<BrowserPollResponse> {
     const clientId = readClientId(payload)
-    this.clients.set(clientId, Date.now())
+    this.observeClient(clientId)
     const queued = this.queue.shift()
     if (queued !== undefined) {
       this.claim(queued)
@@ -133,15 +155,22 @@ export class BrowserHostSession {
    * @param action - the operation the Client performs.
    * @param signal - the tool call's cancellation.
    * @param timeoutMs - deadline for the claimed operation.
+   * @param pageId - the page the model named, when it named one.
    * @returns the Client's outcome for this action.
    */
-  async execute(sessionId: string, action: BrowserAction, signal: AbortSignal, timeoutMs: number): Promise<BrowserOutcome> {
+  async execute(sessionId: string, action: BrowserAction, signal: AbortSignal, timeoutMs: number, pageId?: string): Promise<BrowserOutcome> {
     if (!this.admitting || this.disposed) {
       throw new BrowserSessionError('browser/unavailable', 'the dsh-browser plugin is shutting down and accepts no new browser operations')
     }
     if (signal.aborted) throw new BrowserSessionError('browser/cancelled', 'the browser operation was cancelled before dispatch')
     const commandId = randomUUID()
-    const command: BrowserCommand = { commandId, sessionId, action, limits: this.limits }
+    const command: BrowserCommand = {
+      commandId,
+      sessionId,
+      ...pageId === undefined || pageId.length === 0 ? {} : { pageId },
+      action,
+      limits: this.limits,
+    }
     return await new Promise<BrowserOutcome>((resolve, reject) => {
       const cleanup = (): void => {
         const entry = this.pending.get(commandId)
@@ -178,6 +207,17 @@ export class BrowserHostSession {
       if (waiter !== undefined) {
         this.claim(command)
         waiter.deliver(command)
+        return
+      }
+      // A browser page polls too, but its built-in Browser renders an iframe
+      // instead of the Desktop guest this plugin drives, so waiting would only
+      // time out.
+      if (this.clients.size > 0 && !this.hasDesktopClient()) {
+        cleanup()
+        reject(new BrowserSessionError(
+          'browser/desktop-required',
+          'the browser tools drive the Desktop application\'s built-in Browser tab, and every GUI polling right now is a browser page without that surface; open this session in the DSH Desktop app',
+        ))
         return
       }
       this.queue.push(command)
@@ -240,6 +280,11 @@ function readClientId(payload: unknown): string {
     throw new BrowserSessionError('browser/bad-request', 'the browser Client payload must carry a clientId of 1-128 characters')
   }
   return value
+}
+
+/** @param payload - decoded `hello` payload. @returns whether the renderer announced the Desktop guest. */
+function readDesktop(payload: unknown): boolean {
+  return (payload as { desktop?: unknown }).desktop === true
 }
 
 function readResultPayload(payload: unknown): BrowserResultPayload {

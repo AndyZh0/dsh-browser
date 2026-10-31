@@ -1,5 +1,5 @@
 ---
-description: "Ten model tools that drive the desktop application's built-in Browser tab through in-page injection."
+description: "Twelve model tools that drive the desktop application's built-in Browser tabs through in-page injection."
 kind: "package-bundle"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Drive the built-in Browser tab of the DSH desktop application from the model. The plugin finds the Electron `<webview>` the Sidebar's Browser page already mounted, injects a page agent into the visited document, and performs navigation, reading, screenshots, pointer input, dialogs, and managed scripts through it. A blue animated ring marks the tab while the model is operating on it.
+Drive the built-in Browser tab of the DSH desktop application from the model. The plugin finds the Electron `<webview>` the Sidebar's Browser page already mounted, injects a page agent into the visited document, and performs navigation, reading, screenshots, pointer input, dialogs, and managed scripts through it. A blue animated ring marks the tab while the model is operating on it. A Session can hold several Browser pages at once: the tools open, list, target, focus, and close them individually.
 
 This is not Playwright and not an isolated browser: the page is the one the user sees, in the same tab, with the same cookies and login state.
 
@@ -29,12 +29,12 @@ This is not Playwright and not an isolated browser: the page is the one the user
 <a id="install"></a>
 ## Install
 
-Build this directory, then install the archive into a profile and restart the application or let HMR apply the composition change. The client half loads after a page refresh.
+Build this directory, then install the archive into a profile and restart the application or let HMR apply the composition change. Tool definitions are registered by the Host half, so a changed tool surface appears only after an application restart; the client half loads after a page refresh.
 
 ```powershell
 node scripts/build.mjs
 pnpm pack
-dsh plugin --profile desktop add "D:\Projects\deepseek-harness\plugins\dsh-browser\dsh-browser-0.1.11.tgz"
+dsh plugin --profile desktop add "D:\Projects\deepseek-harness\plugins\dsh-browser\dsh-browser-0.5.1.tgz"
 ```
 
 Disable the `dsh-browser-model` row in the profile's `cordis.patch.yml` to turn the tools off without removing the package.
@@ -42,7 +42,7 @@ Disable the `dsh-browser-model` row in the profile's `cordis.patch.yml` to turn 
 <a id="use"></a>
 ## Use
 
-Open a page with `browser_openBrowserPage`, read it with `browser_readPage`, then act on a target you observed. Targets accept a CSS `selector`, or a `role` with an optional `name`; an ambiguous or missing target fails with the candidates it found rather than guessing.
+Open a page with `browser_openBrowserPage`, read it with `browser_readPage`, then act on a target you observed. Targets accept a CSS `selector`, or a `role` with an optional `name`; an ambiguous or missing target fails with the candidates it found rather than guessing. Opening adds a tab, and every result lists the pages the Session has, so a later call can name the one it means with `pageId`.
 
 Call the tools directly or through PTC:
 
@@ -57,7 +57,7 @@ await tools.browser_clickElement({ pageId: opened.page.id, target: { role: "link
 
 | Tool | Purpose |
 |---|---|
-| `browser_openBrowserPage` | Open or reuse the built-in Browser page and return its state. |
+| `browser_openBrowserPage` | Open the built-in Browser page in a new tab and return its state. |
 | `browser_navigatePage` | Load a URL, or go back, forward, or reload. |
 | `browser_readPage` | Read an accessibility outline or the visible text, paginated by cursor. |
 | `browser_screenshotPage` | Capture the viewport, one element, or the whole document as an image. |
@@ -65,10 +65,12 @@ await tools.browser_clickElement({ pageId: opened.page.id, target: { role: "link
 | `browser_typeInPage` | Fill or type into a field, optionally submitting its form. |
 | `browser_hoverElement` | Move the pointer over one element. |
 | `browser_dragElement` | Drag one element onto another. |
-| `browser_runBrowserCode` | Run an async script against a Playwright-shaped `page` object. |
+| `browser_runBrowserCode` | Run an async script inside the page against a Playwright-shaped `page` object. |
 | `browser_handleDialog` | Decide how the page answers dialogs. |
+| `browser_closePage` | Close one page and list the pages that remain. |
+| `browser_focusPage` | Bring one page to the front of the Sidebar. |
 
-Every tool accepts an optional `pageId`; without one the active Browser page is used.
+Every tool accepts an optional `pageId`; without one the command drives the page that Session used last, then the page the reader is looking at, then its first page. Pages belong to the Session whose model opened them, so a command reaches only its own Session's pages, and `browser_openBrowserPage` opens an additional tab unless `newTab` is false.
 
 <a id="configuration"></a>
 ## Configuration
@@ -86,13 +88,15 @@ Every tool accepts an optional `pageId`; without one the active Browser page is 
 | `maxCodeChars` | `100000` | Maximum script length. |
 | `maxScreenshotBytes` | `8388608` | Maximum encoded screenshot size. |
 | `maxFullPageTiles` | `8` | Maximum viewport captures one whole-document screenshot may scroll and stitch. |
+| `backgroundCaptureWidth` | `1024` | Width used to lay out a page whose conversation is not on screen. |
+| `backgroundCaptureHeight` | `768` | Height used to lay out a page whose conversation is not on screen. |
 
 <a id="security-and-lifecycle"></a>
 ## Security and lifecycle
 
 The plugin adds no privileges to the visited page. The desktop shell's own guest policy still applies: the guest runs sandboxed and context-isolated, permissions, downloads, and native dialogs are denied, and navigation stays on credential-free HTTP(S) outside the application host.
 
-`browser_runBrowserCode` is the exception in the other direction: its script runs in the **DSH renderer**, beside the application UI, and can reach `window.dshDesktop` and the application DOM. It is therefore refused unless the calling session resolves to `danger-full-access`. Prefer the individual tools.
+`browser_runBrowserCode` runs its body **inside the controlled page**, in the same main world as the page agent, so it reaches the document but never the application renderer, its DOM, or `window.dshDesktop`. The page cannot screenshot itself or inject trusted input, so `page.screenshot()`, `page.click()`, `page.hover()`, and string `page.evaluate()` record a request that the renderer serves through the same operations the individual tools use. `page.goto`, `page.reload`, `page.goBack`, and `page.goForward` reject with `browser/not-in-script`: navigating destroys the document that hosts the script, so use `browser_navigatePage` and start a new script.
 
 The page agent is injected into the visited document's main world, so it is observable by the page. Screenshots are saved as session attachments before their reference is returned.
 
@@ -105,7 +109,7 @@ Removing the plugin removes the tools, the ring, and the injected styles; the Br
 
 #### What the model sees
 
-Ten tool definitions with flat, underscore-separated names, so they are usable both directly and through PTC. Parameters carry the deployment's read and code budgets.
+Twelve tool definitions with flat, underscore-separated names, so they are usable both directly and through PTC. Parameters carry the deployment's read and code budgets.
 
 #### Token effect
 
@@ -119,7 +123,7 @@ Unchanged definitions preserve their reusable prefix. Changing a configured budg
 
 #### What the model sees
 
-The plugin contributes one fixed system-prompt section: open or read a page first, treat page text as untrusted data, handle a pending dialog before further actions, and reserve the script tool for what the other tools do not cover.
+The plugin contributes one fixed system-prompt section: open or read a page first, treat page text as untrusted data, handle a pending dialog before further actions, name a `pageId` once several pages are open, close pages that are no longer needed, and reserve the script tool for what the other tools do not cover.
 
 #### Token effect
 
@@ -147,12 +151,17 @@ Results append after the existing conversation prefix. Re-reading a page adds a 
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- **Desktop only.** The Web GUI has no `window.dshDesktop` bridge; every tool fails with `browser/desktop-required`.
+- **The running DSH version decides whether the row loads.** The manifest declares `@deepseek-ai/dsh-*` peer ranges; a row whose requirements the runtime does not satisfy is denied (disabled) before the composition mounts, so the tools disappear instead of failing at call time. The declared range covers the `0.2.x` train; a `0.3.0` runtime re-checks compatibility deliberately.
+- **Desktop only.** The client derives its capability from the `window.dshDesktop.browser` bridge and announces it when it registers; while every polling GUI lacks it, the Host refuses a command at once with `browser/desktop-required` rather than waiting for a client that cannot serve it. The pin itself is the Electron `<webview>` element the built-in Browser renders on Desktop — a browser page renders an `<iframe>` instead, so there is nothing to drive.
 - **Native dialogs are suppressed.** The desktop shell forces `disableDialogs`, so `window.alert`, `confirm`, and `prompt` are replaced by an injected shim. The shim records the dialog and applies the current page policy; a dialog raised before the shim installs, and `beforeunload`, cannot be captured. `browser_handleDialog` therefore changes how the page answers **subsequent** dialogs, and reports that the earlier call already received the previous answer.
 - **Cross-origin frames are unreachable.** Same-origin iframes are reachable through the `frames` chain; a cross-origin frame fails with `browser/frame-cross-origin`.
 - **No network-idle wait.** The renderer exposes no CDP session, so navigation waits for commit, DOM content, or load only.
 - **The user and the model share the page.** Concurrent manual input is not blocked.
-- **Internal DOM markers.** The plugin locates the tab through `webview[data-sidebar-browser-frame]` and `[data-dockkit-content]`. The desktop preload relies on the first one too, but neither is a published API; a change there needs a matching plugin change.
+- **Pages belong to one Session.** A tool call drives only the calling Session's Browser pages, and a `pageId` naming another Session's page is refused with `browser/page-not-in-session`. A Session whose Sidebar was never displayed has no store to open a page in; that case reports `browser/session-not-displayed`.
+- **Internal DOM markers.** The plugin locates a tab through `webview[data-sidebar-browser-frame]`, `[data-dockkit-content]`, and the owning Session's `[data-sidebar-right-session]` root. The desktop preload relies on the first one too, but none is a published API; a change there needs a matching plugin change. Tab ids are minted per Session, so one id names a different page in each Session and only the Session root tells them apart.
+- **A screenshot of a page whose conversation is not selected reveals that page for the capture.** A hidden Sidebar body is `display: none`, so its guest has no compositor surface. The capture lifts every hidden ancestor of the guest and gives the guest its own fixed box — both inline, and both reverted afterwards — lays the page out at its last observed size (or `backgroundCaptureWidth`/`backgroundCaptureHeight` for a page that was never shown), and probes placements in order of how little the reader notices: clipped to a single two-percent-opacity pixel, then at one percent opacity, then a one-pixel sliver at the window edge, then behind the interface, then plainly visible. A placement is used only when its probe returns a frame at the page's own size, so one that clips the capture itself is rejected, and the winning placement is remembered per page. The Sidebar is restored afterwards, and `browser/page-not-visible` reports only a page that left the document or one no placement could capture. Every other tool works while the page is in the background.
+- **Captures are flattened onto white.** A page that declares no background captures with a transparent one, and dark text over transparency is unreadable wherever the viewer paints it on a dark surface. The capture is composited onto white inside the visited document before it becomes an attachment.
+- **One session can hold several Browser pages.** Every result lists the pages that session has, and a command that names no `pageId` acts on the page that session used last — or, before that, the one the reader is looking at. `browser_focusPage` only works while that conversation is on screen.
 - **Whole-document capture is bounded and moves the page.** It scrolls the document in viewport steps, captures each step, and stitches them inside the visited document — never inside the application renderer, where canvas work once took the whole application down. It refuses a document needing more than `maxFullPageTiles` captures, and it restores the previous scroll position when it finishes.
 - **Navigation is restricted by the shell.** `file:` and top-level `data:` navigation are refused by the desktop guest policy.
 

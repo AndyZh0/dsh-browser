@@ -25,6 +25,8 @@ const BROWSER_TOOL_NAMES = [
   'browser_dragElement',
   'browser_runBrowserCode',
   'browser_handleDialog',
+  'browser_closePage',
+  'browser_focusPage',
 ]
 
 interface Harness {
@@ -79,7 +81,7 @@ async function bootPlugin(): Promise<Harness> {
   }
 }
 
-test('the host plugin registers all ten browser tools', async () => {
+test('the host plugin registers all twelve browser tools', async () => {
   const harness = await bootPlugin()
   try {
     const registered = harness.ctx.tools.schemas().map(schema => schema.name)

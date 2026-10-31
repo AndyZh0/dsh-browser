@@ -1,4 +1,4 @@
 {
   "extends": ["./tsconfig.json", "./tsconfig.paths.json"],
-  "include": ["src/client.ts", "src/protocol.ts", "src/client/**/*.ts", "tests/transport.spec.ts", "tests/agent-call.spec.ts", "tests/actions.spec.ts", "tests/script.spec.ts", "tests/full-page.spec.ts", "tests/webview.spec.ts"]
+  "include": ["src/client.ts", "src/protocol.ts", "src/client/**/*.ts", "tests/transport.spec.ts", "tests/agent-call.spec.ts", "tests/actions.spec.ts", "tests/script.spec.ts", "tests/full-page.spec.ts", "tests/webview.spec.ts", "tests/sessions.spec.ts", "tests/guest-surface.spec.ts", "tests/multi-tab.spec.ts"]
 }

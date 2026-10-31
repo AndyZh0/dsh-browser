@@ -144,6 +144,25 @@ test('filling a field sets its value and announces the change', () => {
   assert.equal(changes, 1)
 })
 
+test('typing appends to the value the field already holds', () => {
+  const agent = installDocument('<input id="name" type="text" value="grace">')
+  const input = document.getElementById('name') as HTMLInputElement
+  const typed = agent.typeText({ selector: '#name' }, ' hopper', false)
+  assert.ok(typed.ok)
+  assert.equal(input.value, 'grace hopper')
+})
+
+test('typing into a select element is refused, filling it is not', () => {
+  const agent = installDocument('<select id="pick"><option value="a">Alpha</option><option value="b">Beta</option></select>')
+  const typed = agent.typeText({ selector: '#pick' }, 'b', false)
+  assert.ok(!typed.ok)
+  if (typed.ok) return
+  assert.equal(typed.code, 'browser/target-not-editable')
+  const filled = agent.fill({ selector: '#pick' }, 'b', false)
+  assert.ok(filled.ok)
+  assert.equal((document.getElementById('pick') as HTMLSelectElement).value, 'b')
+})
+
 test('the dialog shim records dialogs and applies the page policy', () => {
   const agent = installDocument('<div></div>')
   assert.equal(window.confirm('proceed?'), false)

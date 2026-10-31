@@ -5,11 +5,16 @@ import type {
 } from '../protocol.ts'
 import { agentCall, BrowserActionError, callAgent, ensurePageAgent } from './agent-call.ts'
 import type { DialogTracker } from './dialogs.ts'
+import { withDeadline } from './deadline.ts'
+import { guestCaptureSize, withPaintedGuest } from './guest-surface.ts'
 import type { PageAgentDialog, PageAgentElementInfo, PageAgentMetrics, PageAgentRead } from './page-agent.ts'
-import { delay, waitForDocument, type WebviewElement } from './webview.ts'
+import { delay, isGuestVisible, waitForDocument, type WebviewElement, type WebviewNativeImage } from './webview.ts'
 
 /** One page action: everything except the renderer-side script action. */
-export type PageAction = Exclude<BrowserAction, { readonly kind: 'code' }>
+export type PageAction = Exclude<
+  BrowserAction,
+  { readonly kind: 'code' } | { readonly kind: 'close' } | { readonly kind: 'focus' }
+>
 
 /** Everything one action needs from the renderer. */
 export interface ActionContext {
@@ -36,7 +41,7 @@ export async function performAction(action: PageAction, ctx: ActionContext, sign
     case 'screenshot': return await runScreenshot(action, ctx, signal)
     case 'click': return await runClick(action, ctx)
     case 'type': return await runType(action, ctx)
-    case 'hover': return await runHover(action, ctx)
+    case 'hover': return await runHover(action, ctx, signal)
     case 'drag': return await runDrag(action, ctx)
     case 'dialog': return await runDialog(action, ctx)
   }
@@ -97,14 +102,62 @@ async function runRead(action: Extract<PageAction, { kind: 'read' }>, ctx: Actio
 }
 
 async function runScreenshot(action: Extract<PageAction, { kind: 'screenshot' }>, ctx: ActionContext, signal: AbortSignal): Promise<BrowserOutcomeData> {
+  if (isGuestVisible(ctx.webview) && ctx.webview.clientWidth > 0) return await captureScreenshot(action, ctx, signal)
+  // A hidden Sidebar body leaves its guest without a compositor surface, so the
+  // capture is taken while the page is laid out off-window instead.
+  const size = guestCaptureSize(ctx.webview, {
+    width: ctx.limits.backgroundCaptureWidth,
+    height: ctx.limits.backgroundCaptureHeight,
+  })
+  return await withPaintedGuest(
+    ctx.webview,
+    size,
+    async () => {
+      const frame = await captureRaw(ctx.webview, undefined, signal)
+      return frame.getSize()
+    },
+    async () => await captureScreenshot(action, ctx, signal),
+  )
+}
+
+/**
+ * Take one raw capture, bounded by the command's deadline.
+ *
+ * Electron never settles a capture for a guest without a compositor surface, so
+ * the bound is what keeps a stalled page from blocking every later command.
+ * @param webview - the mounted webview.
+ * @param rect - the rectangle to capture, or undefined for the whole viewport.
+ * @param signal - the command's deadline.
+ * @returns the native capture.
+ */
+async function captureRaw(webview: WebviewElement, rect: BrowserRect | undefined, signal: AbortSignal): Promise<WebviewNativeImage> {
+  const pending = rect === undefined
+    ? webview.capturePage()
+    : webview.capturePage({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+  return await withDeadline(
+    pending,
+    signal,
+    'browser/screenshot-failed',
+    'the page produced no capturable frame before the deadline',
+  )
+}
+
+/**
+ * Capture one page: the whole document, one element, or the viewport.
+ * @param action - the screenshot the model asked for.
+ * @param ctx - the mounted webview and its limits.
+ * @param signal - the command's cancellation.
+ * @returns the encoded capture.
+ */
+async function captureScreenshot(action: Extract<PageAction, { kind: 'screenshot' }>, ctx: ActionContext, signal: AbortSignal): Promise<BrowserOutcomeData> {
   if (action.fullPage === true) return { image: await captureFullPage(ctx, signal) }
   if (action.target !== undefined) {
     await callAgent<PageAgentElementInfo>(ctx.webview, agentCall('scrollIntoView', action.target), true)
     await delay(120, signal)
     const resolved = await callAgent<PageAgentElementInfo>(ctx.webview, agentCall('resolve', action.target), false)
-    return { image: await captureViewport(ctx.webview, clampRect(ctx.webview, resolved.rect)) }
+    return { image: await captureViewport(ctx.webview, clampRect(ctx.webview, resolved.rect), signal) }
   }
-  return { image: await captureViewport(ctx.webview, undefined) }
+  return { image: await captureViewport(ctx.webview, undefined, signal) }
 }
 
 async function runClick(action: Extract<PageAction, { kind: 'click' }>, ctx: ActionContext): Promise<BrowserOutcomeData> {
@@ -137,10 +190,13 @@ async function runType(action: Extract<PageAction, { kind: 'type' }>, ctx: Actio
   return info === undefined ? {} : { target: info }
 }
 
-async function runHover(action: Extract<PageAction, { kind: 'hover' }>, ctx: ActionContext): Promise<BrowserOutcomeData> {
+async function runHover(action: Extract<PageAction, { kind: 'hover' }>, ctx: ActionContext, signal: AbortSignal): Promise<BrowserOutcomeData> {
   const info = await callAgent<PageAgentElementInfo>(ctx.webview, agentCall('scrollIntoView', action.target), true)
   const point = centreOf(ctx.webview, info.rect)
   await ctx.webview.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y })
+  // The guest dispatches enter/leave from the compositor, so the next observation
+  // would otherwise race the handler.
+  await delay(120, signal)
   return { target: info }
 }
 
@@ -173,13 +229,20 @@ async function runDialog(action: Extract<PageAction, { kind: 'dialog' }>, ctx: A
  * @param rect - the rectangle to capture, or undefined for the whole viewport.
  * @returns the encoded capture.
  */
-async function captureViewport(webview: WebviewElement, rect: BrowserRect | undefined): Promise<BrowserImageResult> {
-  const image = rect === undefined
-    ? await webview.capturePage()
-    : await webview.capturePage({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+async function captureViewport(webview: WebviewElement, rect: BrowserRect | undefined, signal: AbortSignal): Promise<BrowserImageResult> {
+  const image = await captureRaw(webview, rect, signal)
   const width = rect === undefined ? Math.max(1, webview.clientWidth) : Math.max(1, Math.round(rect.width))
   const height = rect === undefined ? Math.max(1, webview.clientHeight) : Math.max(1, Math.round(rect.height))
-  return decodeCapture(dataUrlOf(image), width, height)
+  const captured = dataUrlOf(image)
+  let flattened = captured
+  try {
+    flattened = await callAgent<string>(webview, agentCall('flatten', captured, width, height), false)
+  } catch (error) {
+    // A document with no usable canvas keeps its own capture: a transparent
+    // background is then the page's own rendering, not a failure to report.
+    if (!(error instanceof BrowserActionError)) throw error
+  }
+  return decodeCapture(flattened, width, height)
 }
 
 /**
@@ -210,7 +273,7 @@ async function captureFullPage(ctx: ActionContext, signal: AbortSignal): Promise
       const offset = Math.min(index * viewportHeight, Math.max(0, metrics.scrollHeight - viewportHeight))
       await callAgent(ctx.webview, agentCall('scrollTo', 0, offset), false)
       await delay(140, signal)
-      captured.push(dataUrlOf(await ctx.webview.capturePage()))
+      captured.push(dataUrlOf(await captureRaw(ctx.webview, undefined, signal)))
     }
   } finally {
     await restoreScroll(ctx.webview, metrics)

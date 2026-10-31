@@ -1,12 +1,14 @@
-/** Locate the built-in Browser tab's Electron webview and read its state. */
+/** Locate a Session's built-in Browser tabs and read their state. */
 
 import type { BrowserPageState } from '../protocol.ts'
-import type { BrowserSidebarRight } from './ports.ts'
+import type { BrowserSidebarRight, BrowserTabRecord } from './ports.ts'
 
 /** The DOM marker the built-in Browser renderer and the Desktop shell both rely on. */
 export const WEBVIEW_SELECTOR = 'webview[data-sidebar-browser-frame="webview"]'
 /** The dock-kit marker that carries one tab's identity. */
 export const TAB_HOST_SELECTOR = '[data-dockkit-content]'
+/** The marker that scopes one Session's right Sidebar, which owns its tabs. */
+export const SESSION_ROOT_SELECTOR = '[data-sidebar-right-session]'
 
 /** Raster image returned by the webview's capture operation. */
 export interface WebviewNativeImage {
@@ -74,7 +76,7 @@ function failureOf(element: WebviewElement): string | undefined {
   return recorded === undefined || recorded.length === 0 ? undefined : recorded
 }
 
-/** The Browser tab this plugin drives, when one is available. */
+/** One mounted Browser tab this plugin can drive. */
 export interface BrowserTabHandle {
   readonly tabId: string
   readonly element: WebviewElement
@@ -88,67 +90,124 @@ function tabIdOf(element: Element): string | undefined {
   return id === null || id.length === 0 ? undefined : id
 }
 
-/** Whether a tab's cell is currently selected rather than retained off-screen. */
-function isSelected(element: Element): boolean {
-  return element.closest('[hidden]') === null
-}
-
 /**
- * Find the webview this command should drive.
- * @param pageId - explicit page identity from the model, when it gave one.
- * @param sidebar - the right-Sidebar face, when the plugin has it.
- * @returns the tab handle, or undefined when no Browser page is mounted.
+ * One Session's right-Sidebar root, which owns that Session's tabs.
+ *
+ * Tab ids repeat across Sessions, so a tab id alone does not identify an
+ * element: the owning Sidebar is part of the identity.
+ * @param sessionId - the Session whose Sidebar to find.
+ * @returns the Session's root element, when it is in the document.
  */
-export function findBrowserTab(pageId: string | undefined, sidebar: BrowserSidebarRight | undefined): BrowserTabHandle | undefined {
-  const elements = [...document.querySelectorAll(WEBVIEW_SELECTOR)].filter(
-    (candidate): candidate is WebviewElement => candidate instanceof HTMLElement,
-  )
-  if (elements.length === 0) return undefined
-  if (pageId !== undefined && pageId.length > 0) {
-    for (const element of elements) {
-      const tabId = tabIdOf(element)
-      if (tabId === pageId) return { tabId, element }
-    }
-    return undefined
+function sessionRoot(sessionId: string): HTMLElement | undefined {
+  for (const candidate of document.querySelectorAll(SESSION_ROOT_SELECTOR)) {
+    if (!(candidate instanceof HTMLElement)) continue
+    if (candidate.dataset.sidebarRightSession === sessionId) return candidate
   }
-  const active = sidebar?.active()
-  if (active !== undefined && active.kind === 'browser') {
-    for (const element of elements) {
-      const tabId = tabIdOf(element)
-      if (tabId === active.id) return { tabId, element }
-    }
-  }
-  const selected = elements.filter(isSelected)
-  const element = selected[0] ?? elements[elements.length - 1]
-  if (element === undefined) return undefined
-  const tabId = tabIdOf(element)
-  return tabId === undefined ? undefined : { tabId, element }
+  return undefined
 }
 
 /**
- * Open the built-in Browser page and wait for its webview to mount.
+ * The mounted webview for one Session's tab id.
+ * @param sessionId - the Session that owns the tab.
+ * @param tabId - the tab's id, unique only within its Session.
+ * @returns the element, when that Session's tab is in the document.
+ */
+export function elementForTab(sessionId: string, tabId: string): WebviewElement | undefined {
+  const root = sessionRoot(sessionId)
+  if (root === undefined) return undefined
+  for (const candidate of root.querySelectorAll(WEBVIEW_SELECTOR)) {
+    if (!(candidate instanceof HTMLElement)) continue
+    if (tabIdOf(candidate) === tabId) return candidate as WebviewElement
+  }
+  return undefined
+}
+
+/**
+ * Whether a guest is currently painted.
+ *
+ * A hidden Sidebar body is `display: none`, so its guest has no compositor
+ * surface: every element method still works, but a capture cannot be taken.
+ * @param element - the mounted webview.
+ * @returns whether the guest is visible.
+ */
+export function isGuestVisible(element: WebviewElement): boolean {
+  return element.closest('[hidden], [aria-hidden="true"]') === null
+}
+
+/**
+ * The Browser tabs one Session owns.
+ * @param sessionId - the Session whose tabs to list.
+ * @param sidebar - the right-Sidebar face, when the plugin has it.
+ * @returns that Session's Browser tabs, in inventory order.
+ */
+export function browserTabsOf(sessionId: string, sidebar: BrowserSidebarRight | undefined): readonly BrowserTabRecord[] {
+  const tabs = sidebar?.openTabs.getSnapshot() ?? []
+  return tabs.filter(tab => tab.sessionId === sessionId && tab.kind === 'browser')
+}
+
+/**
+ * Find the mounted Browser page one Session's command should drive.
+ *
+ * Only that Session's tabs are considered, so a command can never act on the
+ * page another Session happens to be showing.
+ * @param sessionId - the Session whose model issued the command.
+ * @param pageId - the page the model named, when it named one.
+ * @param sidebar - the right-Sidebar face, when the plugin has it.
+ * @returns the tab handle, or undefined when that Session has no mounted Browser page.
+ */
+export function findSessionTab(sessionId: string, pageId: string | undefined, sidebar: BrowserSidebarRight | undefined): BrowserTabHandle | undefined {
+  const tabs = browserTabsOf(sessionId, sidebar)
+  const wanted = pageId === undefined || pageId.length === 0 ? tabs[0]?.tabId : pageId
+  if (wanted === undefined) return undefined
+  // An explicit page id is still checked against the Session, so no caller can
+  // reach another Session's page by naming it.
+  if (!tabs.some(tab => tab.tabId === wanted)) return undefined
+  const element = elementForTab(sessionId, wanted)
+  return element === undefined ? undefined : { tabId: wanted, element }
+}
+
+/**
+ * Whether one Session owns a page id.
+ * @param sessionId - the Session to test against.
+ * @param pageId - the page identity the model named.
+ * @param sidebar - the right-Sidebar face, when the plugin has it.
+ * @returns whether that Session's inventory records the page.
+ */
+export function sessionOwnsPage(sessionId: string, pageId: string, sidebar: BrowserSidebarRight | undefined): boolean {
+  return browserTabsOf(sessionId, sidebar).some(tab => tab.tabId === pageId)
+}
+
+/**
+ * Wait for the Browser page a Session just asked for to mount.
+ *
+ * The inventory appends a new tab, so the page that appeared is the one absent
+ * from the ids the Session already had; taking the first tab instead would
+ * report the page the Session was already showing.
+ * @param sessionId - the Session that should receive the page.
+ * @param known - the tab ids that Session had before the open.
  * @param sidebar - the right-Sidebar face.
- * @param url - address the new page should open, when the model gave one.
  * @param signal - the command's cancellation.
  * @returns the mounted tab handle.
- * @throws when the Sidebar is unavailable or the webview never mounts.
+ * @throws when no page appears within the budget.
  */
-export async function openBrowserTab(sidebar: BrowserSidebarRight | undefined, url: string | undefined, signal: AbortSignal): Promise<BrowserTabHandle> {
-  if (sidebar === undefined) {
-    throw new Error('the DSH right Sidebar is unavailable in this renderer, so no built-in Browser page can be opened')
-  }
-  sidebar.openTab('browser', url === undefined ? {} : { params: { url } })
+export async function waitForSessionTab(
+  sessionId: string,
+  known: readonly string[],
+  sidebar: BrowserSidebarRight | undefined,
+  signal: AbortSignal,
+): Promise<BrowserTabHandle> {
   const deadline = Date.now() + 15_000
   while (Date.now() < deadline) {
     if (signal.aborted) throw new Error('the browser operation was cancelled while opening the built-in Browser page')
-    const handle = findBrowserTab(undefined, sidebar)
+    const opened = browserTabsOf(sessionId, sidebar).find(tab => !known.includes(tab.tabId))
+    const handle = opened === undefined ? undefined : findSessionTab(sessionId, opened.tabId, sidebar)
     if (handle !== undefined) {
       await waitForGuestReady(handle.element, signal)
       return handle
     }
     await delay(50, signal)
   }
-  throw new Error('the built-in Browser page did not mount a webview within 15 seconds')
+  throw new Error('the built-in Browser page did not mount within 15 seconds')
 }
 
 /**
@@ -222,24 +281,24 @@ export function pageStateOf(handle: BrowserTabHandle): BrowserPageState {
 }
 
 /**
- * Read every mounted Browser page.
- * @returns one state per Browser tab currently in the document.
+ * Read every mounted Browser page of one Session.
+ * @param sessionId - the Session whose pages to report.
+ * @param sidebar - the right-Sidebar face, when the plugin has it.
+ * @returns one state per mounted Browser tab of that Session.
  */
-export function listPageStates(): readonly BrowserPageState[] {
+export function listPageStates(sessionId: string, sidebar: BrowserSidebarRight | undefined): readonly BrowserPageState[] {
   const states: BrowserPageState[] = []
-  for (const candidate of document.querySelectorAll(WEBVIEW_SELECTOR)) {
-    if (!(candidate instanceof HTMLElement)) continue
-    const tabId = tabIdOf(candidate)
-    if (tabId === undefined) continue
-    const element = candidate as WebviewElement
+  for (const tab of browserTabsOf(sessionId, sidebar)) {
+    const element = elementForTab(sessionId, tab.tabId)
+    if (element === undefined) continue
     observeLoadFailures(element)
     const error = failureOf(element)
     if (!isGuestReady(element)) {
-      states.push({ id: tabId, url: '', title: '', loading: true, ...error === undefined ? {} : { error } })
+      states.push({ id: tab.tabId, url: '', title: '', loading: true, ...error === undefined ? {} : { error } })
       continue
     }
     states.push({
-      id: tabId,
+      id: tab.tabId,
       url: element.getURL(),
       title: element.getTitle(),
       loading: element.isLoading(),

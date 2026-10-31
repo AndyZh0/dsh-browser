@@ -73,6 +73,7 @@ export interface DshPageAgent {
   metrics(): PageAgentResult<PageAgentMetrics>
   scrollTo(x: number, y: number): PageAgentResult<undefined>
   composeTiles(tiles: readonly string[], width: number, height: number, tileHeight: number): Promise<PageAgentResult<string>>
+  flatten(dataUrl: string, width: number, height: number): Promise<PageAgentResult<string>>
   read(options: {
     mode: 'aria' | 'text'
     cursor: number
@@ -101,7 +102,7 @@ declare global {
 export const PAGE_AGENT_SOURCE = '(' + pageAgentMain.toString() + ')()'
 
 /** Version the renderer checks before trusting an already installed agent. */
-export const PAGE_AGENT_VERSION = 1
+export const PAGE_AGENT_VERSION = 2
 
 /** Install the page-side agent; a second call with the same version is a no-op. */
 export function pageAgentMain(): boolean {
@@ -397,9 +398,10 @@ export function pageAgentMain(): boolean {
     return candidates.find(element => roleOf(element) === info.role && nameOf(element) === info.name) ?? null
   }
 
-  function editableValue(element: Element): { set(value: string): void } | undefined {
+  function editableValue(element: Element): { get(): string; set(value: string): void } | undefined {
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
       return {
+        get(): string { return element.value },
         set(value: string): void {
           const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype
           const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value')
@@ -409,6 +411,7 @@ export function pageAgentMain(): boolean {
     }
     if (element instanceof HTMLSelectElement) {
       return {
+        get(): string { return element.value },
         set(value: string): void {
           for (const option of Array.from(element.options)) {
             if (option.value === value || (option.text ?? '').trim() === value) { element.value = option.value; return }
@@ -418,7 +421,10 @@ export function pageAgentMain(): boolean {
       }
     }
     if ((element as HTMLElement).isContentEditable) {
-      return { set(value: string): void { element.textContent = value } }
+      return {
+        get(): string { return element.textContent ?? '' },
+        set(value: string): void { element.textContent = value },
+      }
     }
     return undefined
   }
@@ -435,54 +441,62 @@ export function pageAgentMain(): boolean {
     element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' }))
   }
 
-  function fill(target: PageAgentTarget | null, text: string, submit: boolean): PageAgentResult<PageAgentElementInfo | undefined> {
-    const element = target === null ? (document.activeElement ?? document.body) : null
-    let resolved: PageAgentElementInfo | undefined
-    if (target !== null) {
-      const result = resolve(target)
-      if (!result.ok) return bad(result.code, result.message)
-      resolved = result.value
-      let doc: Document
-      try {
-        doc = frameDocument(target.frames)
-      } catch (error) {
-        const failure = error as { code?: string; message?: string }
-        return bad(failure.code ?? 'browser/frame-missing', failure.message ?? 'the requested frame is unavailable')
-      }
-      const found = target.selector !== undefined && target.selector.length > 0 ? doc.querySelector(target.selector) : findResolved(doc, resolved)
-      if (found === null) return bad('browser/target-missing', 'the resolved element disappeared before filling')
-      ;(found as HTMLElement).focus()
-      const editable = editableValue(found)
-      if (editable === undefined) return bad('browser/target-not-editable', 'the target element does not accept text')
-      editable.set(text)
-      dispatchInput(found, text)
-      if (submit) submitFrom(found)
-      return ok(resolved)
+  /**
+   * Resolve and focus the element a text operation writes to.
+   * @param target - the element to focus, or null for whatever is already focused.
+   * @returns the focused element and the resolved facts, when one was targeted.
+   */
+  function focusFor(target: PageAgentTarget | null): PageAgentResult<{ element: Element; info: PageAgentElementInfo | undefined }> {
+    if (target === null) {
+      const active = document.activeElement
+      if (active === null) return bad('browser/target-missing', 'no element is focused for typing')
+      return ok({ element: active, info: undefined })
     }
-    const editable = editableValue(element as Element)
-    if (editable === undefined) return bad('browser/target-not-editable', 'the focused element does not accept text')
-    editable.set(text)
-    dispatchInput(element as Element, text)
-    if (submit) submitFrom(element as Element)
-    return ok(undefined)
+    const result = resolve(target)
+    if (!result.ok) return bad(result.code, result.message)
+    let doc: Document
+    try {
+      doc = frameDocument(target.frames)
+    } catch (error) {
+      const failure = error as { code?: string; message?: string }
+      return bad(failure.code ?? 'browser/frame-missing', failure.message ?? 'the requested frame is unavailable')
+    }
+    const found = target.selector !== undefined && target.selector.length > 0 ? doc.querySelector(target.selector) : findResolved(doc, result.value)
+    if (found === null) return bad('browser/target-missing', 'the resolved element disappeared before writing to it')
+    ;(found as HTMLElement).focus()
+    return ok({ element: found, info: result.value })
   }
 
+  function fill(target: PageAgentTarget | null, text: string, submit: boolean): PageAgentResult<PageAgentElementInfo | undefined> {
+    const focused = focusFor(target)
+    if (!focused.ok) return focused
+    const { element, info } = focused.value
+    const editable = editableValue(element)
+    if (editable === undefined) return bad('browser/target-not-editable', 'the element does not accept text')
+    editable.set(text)
+    dispatchInput(element, text)
+    if (submit) submitFrom(element)
+    return ok(info)
+  }
+
+  /** Send keystrokes that append to whatever the field already holds. */
   function typeText(target: PageAgentTarget | null, text: string, submit: boolean): PageAgentResult<PageAgentElementInfo | undefined> {
-    const filled = fill(target, '', false)
-    if (!filled.ok) return filled
-    const element = document.activeElement
-    if (element === null) return bad('browser/target-missing', 'no element is focused for typing')
+    const focused = focusFor(target)
+    if (!focused.ok) return focused
+    const { element, info } = focused.value
+    if (element instanceof HTMLSelectElement) return bad('browser/target-not-editable', 'a select element takes fill, not typing')
+    const editable = editableValue(element)
+    if (editable === undefined) return bad('browser/target-not-editable', 'the element does not accept text')
     for (const character of Array.from(text)) {
       element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: character }))
       element.dispatchEvent(new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key: character }))
-      const editable = editableValue(element)
-      if (editable !== undefined) editable.set(((element as HTMLInputElement).value ?? '') + character)
+      editable.set(editable.get() + character)
       element.dispatchEvent(new InputEvent('input', { bubbles: true, data: character, inputType: 'insertText' }))
       element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: character }))
     }
     element.dispatchEvent(new Event('change', { bubbles: true }))
     if (submit) submitFrom(element)
-    return ok(filled.value)
+    return ok(info)
   }
 
   function pointerOptions(modifiers: readonly string[]): MouseEventInit {
@@ -635,6 +649,8 @@ export function pageAgentMain(): boolean {
     const context = canvas.getContext('2d')
     if (context === null) return bad('browser/screenshot-failed', 'the page exposes no 2D canvas context for stitching')
     try {
+      context.fillStyle = '#ffffff'
+      context.fillRect(0, 0, canvas.width, canvas.height)
       for (let index = 0; index < tiles.length; index += 1) {
         const tile = tiles[index]
         if (tile === undefined) continue
@@ -644,6 +660,35 @@ export function pageAgentMain(): boolean {
       }
     } catch (error) {
       return bad('browser/screenshot-failed', 'stitching failed: ' + (error instanceof Error ? error.message : String(error)))
+    }
+    return ok(canvas.toDataURL('image/png'))
+  }
+
+  /**
+   * Composite one capture onto an opaque base.
+   *
+   * A document that declares no background captures with a transparent one, and
+   * dark text over transparency is unreadable wherever the viewer paints it on a
+   * dark surface. The base is white because that is what the guest shows such a
+   * document over.
+   * @param dataUrl - the capture to flatten.
+   * @param width - the capture's width in pixels.
+   * @param height - the capture's height in pixels.
+   * @returns the flattened capture.
+   */
+  async function flatten(dataUrl: string, width: number, height: number): Promise<PageAgentResult<string>> {
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.min(Math.round(width), MAX_CANVAS_WIDTH))
+    canvas.height = Math.max(1, Math.min(Math.round(height), MAX_CANVAS_HEIGHT))
+    const context = canvas.getContext('2d')
+    if (context === null) return bad('browser/screenshot-failed', 'the page exposes no 2D canvas context for flattening')
+    try {
+      const picture = await loadTile(dataUrl)
+      context.fillStyle = '#ffffff'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.drawImage(picture, 0, 0)
+    } catch (error) {
+      return bad('browser/screenshot-failed', 'flattening failed: ' + (error instanceof Error ? error.message : String(error)))
     }
     return ok(canvas.toDataURL('image/png'))
   }
@@ -695,6 +740,7 @@ export function pageAgentMain(): boolean {
     metrics,
     scrollTo,
     composeTiles,
+    flatten,
     scrollIntoView,
     fill,
     typeText,

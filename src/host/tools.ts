@@ -1,4 +1,4 @@
-/** The ten model-facing browser tools and their projections. */
+/** The twelve model-facing browser tools and their projections. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { AttachmentId, type ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -92,20 +92,21 @@ export interface BrowserToolDeps {
 }
 
 /**
- * Register all ten browser tools in the calling scope.
+ * Register all twelve browser tools in the calling scope.
  * @param deps - context, session, and resolved configuration.
  */
 export function registerBrowserTools(deps: BrowserToolDeps): void {
   const { ctx, session, config } = deps
 
-  const dispatch = async (exec: ToolRunContext, action: BrowserAction, timeoutMs: number): Promise<BrowserOutcome> =>
-    await session.execute(exec.agent?.session.id ?? 'unattributed', action, exec.signal, timeoutMs)
+  const dispatch = async (exec: ToolRunContext, action: BrowserAction, timeoutMs: number, pageId: string | undefined): Promise<BrowserOutcome> =>
+    await session.execute(exec.agent?.session.id ?? 'unattributed', action, exec.signal, timeoutMs, pageId)
 
   ctx.tools.register(defineTool({
     name: 'browser_openBrowserPage',
-    description: 'Open the built-in browser on a page and return its state. Use the returned page id as pageId for later calls. When no browser page is open yet, a url is required: the page mounts no document until it loads one.',
+    description: 'Open the built-in browser on a page and return its state. Opens a new tab by default, so several pages can be open at once; pass newTab false to reuse the page this session used last. Use the returned page id as pageId for later calls. When no browser page is open yet, a url is required: the page mounts no document until it loads one.',
     parameters: {
       url: { type: 'string', description: 'HTTP(S) address to open. Required when no browser page is open yet; the desktop browser rejects other schemes.' },
+      newTab: { type: 'boolean', description: 'Open an additional tab instead of reusing the page this session used last. Defaults to true.' },
     },
     output: {
       schema: {
@@ -119,7 +120,54 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
       render: (_args, value) => [{ type: 'text', text: describeOutcome(value.page, value.pages) }],
     },
     async execute(args, exec) {
-      const outcome = await dispatch(exec, { kind: 'open', ...args.url === undefined ? {} : { url: args.url } }, config.operationTimeoutMs)
+      // Opening is addressed by Session alone: the tool names no page yet.
+      const outcome = await dispatch(exec, { kind: 'open', newTab: args.newTab ?? true, ...args.url === undefined ? {} : { url: args.url } }, config.operationTimeoutMs, undefined)
+      return { page: outcome.page, pages: [...outcome.pages] }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_closePage',
+    description: 'Close one built-in browser page. The result names the page that was closed and lists the pages that remain; closing the last one leaves this session with no built-in browser page open.',
+    parameters: {
+      pageId: { type: 'string', description: 'Page to close. Omit to close the page this session used last.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          page: { ...pageStateSchema, required: true },
+          pages: pageListSchema,
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: 'Closed ' + value.page.id + '\n' + describePages(value.pages) }],
+    },
+    async execute(args, exec) {
+      const outcome = await dispatch(exec, { kind: 'close' }, config.operationTimeoutMs, args.pageId)
+      return { page: outcome.page, pages: [...outcome.pages] }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_focusPage',
+    description: 'Bring one built-in browser page to the front of the Sidebar so the reader sees it. Only meaningful while this conversation is the one on screen.',
+    parameters: {
+      pageId: { type: 'string', description: 'Page to bring forward. Omit to use the page this session used last.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          page: { ...pageStateSchema, required: true },
+          pages: pageListSchema,
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: 'Focused ' + describePage(value.page) + '\n' + describePages(value.pages) }],
+    },
+    async execute(args, exec) {
+      const outcome = await dispatch(exec, { kind: 'focus' }, config.operationTimeoutMs, args.pageId)
       return { page: outcome.page, pages: [...outcome.pages] }
     },
   }))
@@ -154,7 +202,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         ...args.url === undefined ? {} : { url: args.url },
         ...args.waitUntil === undefined ? {} : { waitUntil: args.waitUntil },
       }
-      const outcome = await dispatch(exec, action, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, action, config.operationTimeoutMs, args.pageId)
       return { page: outcome.page, pages: [...outcome.pages] }
     },
   }))
@@ -199,7 +247,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         ...args.limit === undefined ? {} : { limit: args.limit },
         ...args.target === undefined ? {} : { target: args.target },
       }
-      const outcome = await dispatch(exec, action, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, action, config.operationTimeoutMs, args.pageId)
       const read = outcome.data?.read
       if (read === undefined) throw new Error('the browser client returned no read result')
       const content = read.content.slice(0, config.maxReadChars)
@@ -218,7 +266,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
 
   ctx.tools.register(defineTool({
     name: 'browser_screenshotPage',
-    description: 'Capture the built-in browser page as an image the model can see. Captures the viewport, or one element when target is given, or the whole document when fullPage is true (captured by scrolling the page in viewport-sized steps and stitching them).',
+    description: 'Capture the built-in browser page as an image the model can see. Captures the viewport, or one element when target is given, or the whole document when fullPage is true (captured by scrolling the page in viewport-sized steps and stitching them). Works while the page is in the background.',
     parameters: {
       pageId: { type: 'string', description: 'Target page id. Omit to use the active browser page.' },
       target: { ...targetSchema, description: 'Capture only this element.' },
@@ -255,7 +303,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         ...args.target === undefined ? {} : { target: args.target },
         ...args.fullPage === undefined ? {} : { fullPage: args.fullPage },
       }
-      const outcome = await dispatch(exec, action, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, action, config.operationTimeoutMs, args.pageId)
       const image = outcome.data?.image
       if (image === undefined) throw new Error('the browser client returned no screenshot')
       const bytes = Buffer.from(image.dataBase64, 'base64')
@@ -319,7 +367,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         ...args.clickCount === undefined ? {} : { clickCount: args.clickCount },
         ...args.modifiers === undefined ? {} : { modifiers: args.modifiers },
       }
-      const outcome = await dispatch(exec, action, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, action, config.operationTimeoutMs, args.pageId)
       const target = requireElement(outcome)
       return {
         page: outcome.page,
@@ -332,12 +380,12 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
 
   ctx.tools.register(defineTool({
     name: 'browser_typeInPage',
-    description: 'Enter text into the built-in browser page: fill one element, or type into the focused element when no target is given. Optionally submit the enclosing form.',
+    description: 'Enter text into the built-in browser page: fill one element, or write into the focused element when no target is given. Optionally submit the enclosing form.',
     parameters: {
       pageId: { type: 'string', description: 'Target page id. Omit to use the active browser page.' },
       target: { ...targetSchema, description: 'Field to receive the text; omit to use the focused element.' },
       text: { type: 'string', required: true, description: 'Text to enter.' },
-      mode: { type: 'string', enum: ['fill', 'type'], description: 'Replace the value at once (fill, default) or type key by key.' },
+      mode: { type: 'string', enum: ['fill', 'type'], description: 'Replace the value at once (fill, default) or send keystrokes that append to what the field already holds (type).' },
       submit: { type: 'boolean', description: 'Submit the enclosing form after entering the text.' },
     },
     output: {
@@ -361,7 +409,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         ...args.mode === undefined ? {} : { mode: args.mode },
         ...args.submit === undefined ? {} : { submit: args.submit },
       }
-      const outcome = await dispatch(exec, action, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, action, config.operationTimeoutMs, args.pageId)
       const target = outcome.data?.target
       return {
         page: outcome.page,
@@ -393,7 +441,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
       render: (_args, value) => [{ type: 'text', text: 'Hovered ' + describeElement(value.target) + '\n' + describeOutcome(value.page, value.pages) }],
     },
     async execute(args, exec) {
-      const outcome = await dispatch(exec, { kind: 'hover', target: args.target }, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, { kind: 'hover', target: args.target }, config.operationTimeoutMs, args.pageId)
       const target = requireElement(outcome)
       return {
         page: outcome.page,
@@ -427,7 +475,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
       render: (_args, value) => [{ type: 'text', text: 'Dragged ' + describeElement(value.source) + ' onto ' + describeElement(value.target) + '\n' + describeOutcome(value.page, value.pages) }],
     },
     async execute(args, exec) {
-      const outcome = await dispatch(exec, { kind: 'drag', source: args.source, target: args.target }, config.operationTimeoutMs)
+      const outcome = await dispatch(exec, { kind: 'drag', source: args.source, target: args.target }, config.operationTimeoutMs, args.pageId)
       const source = outcome.data?.source
       const target = outcome.data?.target
       if (source === undefined || target === undefined) throw new Error('the browser client returned no drag result')
@@ -443,7 +491,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
 
   ctx.tools.register(defineTool({
     name: 'browser_runBrowserCode',
-    description: 'Run an async script against the built-in browser page for work the other browser tools do not cover. The body receives a page object with goto, click, fill, type, hover, dragTo, waitForSelector, textContent, evaluate, and screenshot. Requires the danger-full-access sandbox mode.',
+    description: 'Run an async script inside the built-in browser page for work the other browser tools do not cover. The body runs in the page and receives a page object with click, fill, type, hover, dragTo, waitForSelector, waitForTimeout, querySelector, querySelectorAll, textContent, evaluate, screenshot, url, and title; goto, reload, goBack, and goForward reject because navigating would end the script. Return a JSON value.',
     parameters: {
       pageId: { type: 'string', description: 'Target page id. Omit to use the active browser page.' },
       code: { type: 'string', required: true, description: 'Async function body receiving page. Return a JSON value to report a result.' },
@@ -472,12 +520,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
       if (args.code.length > config.maxCodeChars) {
         throw new Error('the script is ' + String(args.code.length) + ' characters, above the configured maxCodeChars of ' + String(config.maxCodeChars))
       }
-      const request = exec.agent === undefined ? {} : { session: exec.agent.session }
-      const mode = ctx.sandboxPolicy.resolve(request).mode
-      if (mode !== 'danger-full-access') {
-        throw new Error('browser_runBrowserCode requires the danger-full-access sandbox mode; this session resolves to ' + mode + '. Use the individual browser tools instead.')
-      }
-      const outcome = await dispatch(exec, { kind: 'code', code: args.code }, args.timeoutMs ?? config.codeTimeoutMs)
+      const outcome = await dispatch(exec, { kind: 'code', code: args.code }, args.timeoutMs ?? config.codeTimeoutMs, args.pageId)
       const script = outcome.data?.script
       if (script === undefined) throw new Error('the browser client returned no script result')
       return {
@@ -524,7 +567,7 @@ export function registerBrowserTools(deps: BrowserToolDeps): void {
         accept: args.accept,
         ...args.promptText === undefined ? {} : { promptText: args.promptText },
       }
-      const outcome = await dispatch(exec, action, config.dialogTimeoutMs)
+      const outcome = await dispatch(exec, action, config.dialogTimeoutMs, args.pageId)
       const dialog = outcome.data?.dialog
       if (dialog === undefined) throw new Error('the browser client returned no dialog result')
       return {
@@ -552,9 +595,12 @@ function describeElement(element: BrowserElementInfo): string {
   return element.selector + ' (' + element.role + (element.name.length === 0 ? '' : ' ' + JSON.stringify(element.name)) + ')'
 }
 
+function describePages(pages: readonly BrowserPageState[]): string {
+  return String(pages.length) + ' browser page(s): ' + pages.map(entry => entry.id + ' ' + entry.url).join(', ')
+}
+
 function describeOutcome(page: BrowserPageState, pages: readonly BrowserPageState[]): string {
-  return describePage(page) + '\n' + String(pages.length) + ' browser page(s): '
-    + pages.map(entry => entry.id + ' ' + entry.url).join(', ')
+  return describePage(page) + '\n' + describePages(pages)
 }
 
 function describePage(page: BrowserPageState): string {

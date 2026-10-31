@@ -100,3 +100,38 @@ test('disposal rejects a pending command and stops admitting', async () => {
   assert.equal(error.code, 'browser/unavailable')
   await assert.rejects(session.execute('s1', { kind: 'navigate', direction: 'reload' }, new AbortController().signal, 1_000), (next: unknown) => next instanceof BrowserSessionError && next.code === 'browser/unavailable')
 })
+
+test('a GUI that announced no Desktop surface refuses the command at once', async () => {
+  const session = makeSession({ clientWaitMs: 5_000 })
+  session.hello({ clientId: 'web', desktop: false })
+  const started = Date.now()
+  const error = await rejection(session.execute('s1', { kind: 'navigate', direction: 'reload' }, new AbortController().signal, 1_000))
+  assert.ok(error instanceof BrowserSessionError)
+  assert.equal(error.code, 'browser/desktop-required')
+  // The refusal must not wait out the client window.
+  assert.ok(Date.now() - started < 1_000)
+})
+
+test('a GUI that announced the Desktop surface accepts the command', async () => {
+  const session = makeSession()
+  session.hello({ clientId: 'desktop', desktop: true })
+  const pending = session.execute('s1', { kind: 'navigate', direction: 'reload' }, new AbortController().signal, 1_000)
+  const polled = await session.poll({ clientId: 'desktop' }, new AbortController().signal)
+  assert.ok('command' in polled)
+  if (!('command' in polled)) throw new Error('expected a claimed command')
+  session.settle({ commandId: polled.command.commandId, ok: true, outcome: OUTCOME })
+  assert.equal((await pending).page.id, 'p1')
+})
+
+test('a later poll keeps the surface its client announced', async () => {
+  const session = makeSession({ pollTimeoutMs: 20 })
+  session.hello({ clientId: 'desktop', desktop: true })
+  // The poll payload carries no capability, so it must not reset the record.
+  await session.poll({ clientId: 'desktop' }, new AbortController().signal)
+  const pending = session.execute('s1', { kind: 'navigate', direction: 'reload' }, new AbortController().signal, 1_000)
+  const polled = await session.poll({ clientId: 'desktop' }, new AbortController().signal)
+  assert.ok('command' in polled)
+  if (!('command' in polled)) throw new Error('expected a claimed command')
+  session.settle({ commandId: polled.command.commandId, ok: true, outcome: OUTCOME })
+  await pending
+})

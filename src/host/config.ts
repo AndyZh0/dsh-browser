@@ -26,6 +26,10 @@ export interface BrowserConfig {
   maxScreenshotBytes?: number
   /** Maximum viewport tiles one whole-document capture may scroll and stitch. */
   maxFullPageTiles?: number
+  /** Width used to lay out a page whose conversation is not on screen. */
+  backgroundCaptureWidth?: number
+  /** Height used to lay out a page whose conversation is not on screen. */
+  backgroundCaptureHeight?: number
 }
 
 /** Fully resolved browser configuration. */
@@ -41,6 +45,8 @@ export interface ResolvedBrowserConfig {
   readonly maxCodeChars: number
   readonly maxScreenshotBytes: number
   readonly maxFullPageTiles: number
+  readonly backgroundCaptureWidth: number
+  readonly backgroundCaptureHeight: number
 }
 
 /** Loader schema for every browser limit, with the deployment defaults applied. */
@@ -56,6 +62,8 @@ export const BrowserConfigSchema: Schema<BrowserConfig> = Schema.object({
   maxCodeChars: Schema.number().step(1).min(1).default(100_000),
   maxScreenshotBytes: Schema.number().step(1).min(1).default(8_388_608),
   maxFullPageTiles: Schema.number().step(1).min(1).default(8),
+  backgroundCaptureWidth: Schema.number().step(1).min(1).default(1_024),
+  backgroundCaptureHeight: Schema.number().step(1).min(1).default(768),
 })
 
 /**
@@ -76,5 +84,7 @@ export function resolveBrowserConfig(input: BrowserConfig = {}): ResolvedBrowser
     maxCodeChars: input.maxCodeChars ?? 100_000,
     maxScreenshotBytes: input.maxScreenshotBytes ?? 8_388_608,
     maxFullPageTiles: input.maxFullPageTiles ?? 8,
+    backgroundCaptureWidth: input.backgroundCaptureWidth ?? 1_024,
+    backgroundCaptureHeight: input.backgroundCaptureHeight ?? 768,
   }
 }

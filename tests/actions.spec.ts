@@ -10,8 +10,11 @@ const LIMITS: BrowserCommandLimits = {
   lingerMs: 2_000,
   maxReadChars: 40_000,
   maxOutputChars: 50_000,
+  operationTimeoutMs: 30_000,
   codeTimeoutMs: 180_000,
   maxFullPageTiles: 8,
+  backgroundCaptureWidth: 1_024,
+  backgroundCaptureHeight: 768,
 }
 
 function contextRecording(evaluated: string[]): ActionContext {
@@ -24,6 +27,7 @@ function contextRecording(evaluated: string[]): ActionContext {
       if (code.includes('.read(')) {
         return Promise.resolve({ ok: true, value: { mode: 'text', content: 'hello', cursor: 0, truncated: false } })
       }
+      if (code.includes('.flatten(')) return Promise.resolve({ ok: true, value: 'data:image/png;base64,QUJD' })
       return Promise.resolve({ ok: true, value: {} })
     },
   } as unknown as WebviewElement

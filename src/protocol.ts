@@ -85,7 +85,9 @@ export type BrowserInputMode = 'fill' | 'type'
 
 /** One operation the Client performs against the built-in Browser tab. */
 export type BrowserAction =
-  | { readonly kind: 'open'; readonly url?: string }
+  | { readonly kind: 'open'; readonly url?: string; readonly newTab?: boolean }
+  | { readonly kind: 'close' }
+  | { readonly kind: 'focus' }
   | {
     readonly kind: 'navigate'
     readonly direction: BrowserNavigateDirection
@@ -127,16 +129,25 @@ export interface BrowserCommandLimits {
   readonly maxReadChars: number
   /** Character budget for one managed-script rendering. */
   readonly maxOutputChars: number
+  /** Deadline for one claimed operation, mirrored so the Client can free itself. */
+  readonly operationTimeoutMs: number
   /** Deadline for one managed script, mirrored to the script's own timeout. */
   readonly codeTimeoutMs: number
   /** Maximum viewport tiles one whole-document capture may scroll and stitch. */
   readonly maxFullPageTiles: number
+  /** Width used to lay out a page whose conversation is not on screen. */
+  readonly backgroundCaptureWidth: number
+  /** Height used to lay out a page whose conversation is not on screen. */
+  readonly backgroundCaptureHeight: number
 }
 
 /** One Host-issued command claimed by a Client poll. */
 export interface BrowserCommand {
   readonly commandId: BrowserCommandId
+  /** The Session whose model issued this command; the Client drives only that session's pages. */
   readonly sessionId: string
+  /** The page the model named, when it named one. */
+  readonly pageId?: string
   readonly action: BrowserAction
   readonly limits: BrowserCommandLimits
 }
@@ -176,6 +187,7 @@ export interface BrowserOutcomeData {
 
 /** Successful command settlement. */
 export interface BrowserOutcome {
+  /** The page the command acted on; a close reports the page it removed. */
   readonly page: BrowserPageState
   readonly pages: readonly BrowserPageState[]
   readonly dialogPending?: BrowserPendingDialog

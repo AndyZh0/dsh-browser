@@ -7,7 +7,10 @@ import type { BrowserCommandLimits } from '../src/protocol.ts'
 import type { WebviewElement } from '../src/client/webview.ts'
 
 function limits(maxFullPageTiles: number): BrowserCommandLimits {
-  return { lingerMs: 2_000, maxReadChars: 40_000, maxOutputChars: 50_000, codeTimeoutMs: 180_000, maxFullPageTiles }
+  return {
+    lingerMs: 2_000, maxReadChars: 40_000, maxOutputChars: 50_000, operationTimeoutMs: 30_000, codeTimeoutMs: 180_000, maxFullPageTiles,
+    backgroundCaptureWidth: 1_024, backgroundCaptureHeight: 768,
+  }
 }
 
 interface Recorded {
@@ -19,6 +22,8 @@ function fullPageContext(recorded: Recorded, maxFullPageTiles: number): ActionCo
   const webview = {
     clientWidth: 800,
     clientHeight: 600,
+    // The stub stands for a guest whose Session is on screen.
+    closest: () => null,
     executeJavaScript: (code: string) => {
       recorded.evaluated.push(code)
       if (code.includes('__dshBrowserAgent =') || code.includes('pageAgentMain')) return Promise.resolve(true)
@@ -26,6 +31,7 @@ function fullPageContext(recorded: Recorded, maxFullPageTiles: number): ActionCo
         return Promise.resolve({ ok: true, value: { scrollX: 0, scrollY: 0, scrollWidth: 800, scrollHeight: 1800, viewportWidth: 800, viewportHeight: 600 } })
       }
       if (code.includes('.composeTiles(')) return Promise.resolve({ ok: true, value: 'data:image/png;base64,QUJD' })
+      if (code.includes('.flatten(')) return Promise.resolve({ ok: true, value: 'data:image/png;base64,QUJD' })
       return Promise.resolve({ ok: true, value: undefined })
     },
     capturePage: () => {

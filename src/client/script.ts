@@ -1,11 +1,12 @@
-/** Run a model-authored script in the renderer against a Playwright-shaped page facade. */
+/** Run a model-authored script inside the controlled page, servicing what the page cannot do itself. */
 
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { BrowserElementInfo, BrowserImageResult, BrowserTarget, BrowserWaitUntil } from '../protocol.ts'
 import { performAction, type ActionContext } from './actions.ts'
-import { agentCall, BrowserActionError, callAgent, ensurePageAgent } from './agent-call.ts'
-import type { PageAgentElementInfo, PageAgentRead } from './page-agent.ts'
-import { delay } from './webview.ts'
+import { BrowserActionError, ensurePageAgent } from './agent-call.ts'
+import { withDeadline } from './deadline.ts'
+import { PAGE_SCRIPT_SOURCE, type PageScriptRequest } from './page-script.ts'
+import { delay, type WebviewElement } from './webview.ts'
 
 /** Console surface exposed to a managed script. */
 export interface ScriptConsole {
@@ -15,13 +16,22 @@ export interface ScriptConsole {
   error(...values: readonly unknown[]): void
 }
 
-/** The page object a managed script receives. */
+/**
+ * The page object a managed script receives.
+ *
+ * The script runs in the page, so the navigation methods cannot run there: they
+ * reject with `browser/not-in-script` and point at `browser_navigatePage`.
+ */
 export interface BrowserPageFacade {
+  /** Unavailable inside a script; navigation replaces the document and ends it. */
   goto(url: string, options?: { readonly waitUntil?: BrowserWaitUntil }): Promise<void>
   url(): string
   title(): string
+  /** Unavailable inside a script; see {@link BrowserPageFacade.goto}. */
   reload(): Promise<void>
+  /** Unavailable inside a script; see {@link BrowserPageFacade.goto}. */
   goBack(): Promise<void>
+  /** Unavailable inside a script; see {@link BrowserPageFacade.goto}. */
   goForward(): Promise<void>
   waitForSelector(selector: string, options?: { readonly timeoutMs?: number }): Promise<BrowserElementInfo>
   waitForTimeout(ms: number): Promise<void>
@@ -43,11 +53,28 @@ export interface ScriptOutcome {
   readonly logs: readonly string[]
 }
 
-const MAX_LOG_ENTRIES = 200
-const MAX_LOG_CHARS = 2_000
+/** How often the renderer asks the page whether it needs something. */
+const POLL_INTERVAL_MS = 40
 
 /**
- * Execute one managed script against the mounted page.
+ * Install the script runtime in the page.
+ * @param webview - the mounted webview.
+ * @throws BrowserActionError when the document refuses the installation.
+ */
+export async function ensurePageScript(webview: WebviewElement): Promise<void> {
+  const installed = await webview.executeJavaScript(PAGE_SCRIPT_SOURCE, false)
+  if (installed !== true) {
+    throw new BrowserActionError('browser/script-failed', 'the script runtime did not install in the controlled document')
+  }
+}
+
+/**
+ * Execute one managed script inside the controlled page.
+ *
+ * The body runs in the page, so it can reach the document directly. The page
+ * cannot screenshot itself or inject trusted input, so those calls — and string
+ * evaluation, which a page's CSP may forbid — are recorded as requests and
+ * served here while the script awaits them.
  * @param ctx - the mounted webview, its limits, and the dialog tracker.
  * @param code - the script body, receiving `page` and `console`.
  * @param timeoutMs - the script's own deadline.
@@ -55,129 +82,167 @@ const MAX_LOG_CHARS = 2_000
  * @returns the script's JSON result and captured console output.
  */
 export async function runBrowserScript(ctx: ActionContext, code: string, timeoutMs: number, signal: AbortSignal): Promise<ScriptOutcome> {
+  await ensurePageAgent(ctx.webview)
+  await ensurePageScript(ctx.webview)
+  await ctx.webview.executeJavaScript('globalThis.__dshBrowserScript.reset()', false)
   const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-  const logs: string[] = []
-  const facade = createFacade(ctx, deadline)
-  const consoleProxy = createConsole(logs)
-  const factory = new Function('page', 'console', 'return (async () => {' + code + '\n})()') as
-    (page: BrowserPageFacade, scriptConsole: ScriptConsole) => Promise<unknown>
-  const raw = await factory(facade, consoleProxy)
-  return { result: toJson(raw), logs }
-}
-
-function createConsole(logs: string[]): ScriptConsole {
-  const record = (...values: readonly unknown[]): void => {
-    if (logs.length >= MAX_LOG_ENTRIES) return
-    logs.push(values.map(value => describeValue(value)).join(' ').slice(0, MAX_LOG_CHARS))
-  }
-  return { log: record, info: record, warn: record, error: record }
-}
-
-function describeValue(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (value instanceof Error) return value.message
+  const state = { done: false }
+  const running = ctx.webview.executeJavaScript(wrapScript(code), false)
+  const serving = serveRequests(ctx, state, deadline)
+  let raw: unknown
   try {
-    return JSON.stringify(value) ?? String(value)
+    raw = await withDeadline(running, deadline, 'browser/timeout', 'the script did not finish before its deadline')
   } catch (error) {
-    // A cyclic or otherwise unserializable console argument still has a textual form.
-    console.warn('dsh-browser: console argument is not JSON-serializable', error)
-    return String(value)
+    if (error instanceof BrowserActionError) throw error
+    throw new BrowserActionError(
+      'browser/script-failed',
+      'the script could not be evaluated in the page: ' + (error instanceof Error ? error.message : String(error)),
+    )
+  } finally {
+    state.done = true
+    await serving
+  }
+  const envelope = raw as { readonly ok?: unknown; readonly value?: unknown; readonly error?: { readonly code?: unknown; readonly message?: unknown } } | null
+  if (envelope === null || typeof envelope !== 'object' || typeof envelope.ok !== 'boolean') {
+    throw new BrowserActionError('browser/script-failed', 'the page returned no script result')
+  }
+  if (!envelope.ok) {
+    throw new BrowserActionError(
+      String(envelope.error?.code ?? 'browser/script-failed'),
+      String(envelope.error?.message ?? 'the script failed inside the page'),
+    )
+  }
+  return { result: (envelope.value ?? null) as JsonValue, logs: await readLogs(ctx.webview) }
+}
+
+/**
+ * Wrap one script body so the page can run it and report both outcomes.
+ * @param code - the model's script body.
+ * @returns a self-contained expression evaluated in the page.
+ */
+function wrapScript(code: string): string {
+  return [
+    '(async () => {',
+    '  const runtime = globalThis.__dshBrowserScript;',
+    '  if (runtime === undefined) return { ok: false, error: { code: "browser/agent-failed", message: "the script runtime is not installed" } };',
+    '  try {',
+    '    const value = await (async (page, console) => {',
+    code,
+    '    })(runtime.page, runtime.console);',
+    '    let json = null;',
+    '    try { json = value === undefined ? null : JSON.parse(JSON.stringify(value)); }',
+    '    catch (error) { json = null; }',
+    '    return { ok: true, value: json };',
+    '  } catch (error) {',
+    '    const code = error && error.code ? String(error.code) : "browser/script-failed";',
+    '    const message = error && error.message ? String(error.message) : String(error);',
+    '    return { ok: false, error: { code, message } };',
+    '  }',
+    '})()',
+  ].join('\n')
+}
+
+/**
+ * Answer the page's recorded requests until the script settles.
+ * @param ctx - the mounted webview and its limits.
+ * @param state - shared flag the runner sets when the script is done.
+ * @param deadline - the script's deadline.
+ */
+async function serveRequests(ctx: ActionContext, state: { done: boolean }, deadline: AbortSignal): Promise<void> {
+  while (!state.done && !deadline.aborted) {
+    let request: PageScriptRequest | null
+    try {
+      request = await ctx.webview.executeJavaScript('globalThis.__dshBrowserScript.take()', false) as PageScriptRequest | null
+    } catch (error) {
+      // The document may be gone; the runner reports the script's own failure.
+      if (error instanceof Error) return
+      throw error
+    }
+    if (request === null || request === undefined) {
+      await delay(POLL_INTERVAL_MS, deadline).catch(() => undefined)
+      continue
+    }
+    await answer(ctx, request, deadline)
   }
 }
 
-function toJson(value: unknown): JsonValue {
-  if (value === undefined) return null
+/**
+ * Perform one recorded request and resolve the page's pending promise.
+ * @param ctx - the mounted webview and its limits.
+ * @param request - the operation the page asked for.
+ * @param deadline - the script's deadline.
+ */
+async function answer(ctx: ActionContext, request: PageScriptRequest, deadline: AbortSignal): Promise<void> {
+  let ok = true
+  let payload: unknown
   try {
-    return JSON.parse(JSON.stringify(value)) as JsonValue
+    payload = await serveRequest(ctx, request, deadline)
   } catch (error) {
-    throw new BrowserActionError('browser/script-result-not-serializable', 'the script result is not JSON-serializable: ' + String(error))
+    ok = false
+    payload = error instanceof BrowserActionError
+      ? { code: error.code, message: error.message }
+      : { code: 'browser/script-failed', message: error instanceof Error ? error.message : String(error) }
   }
+  await ctx.webview.executeJavaScript(
+    'globalThis.__dshBrowserScript.settle(' + String(request.id) + ', ' + (ok ? 'true' : 'false') + ', ' + JSON.stringify(payload ?? null) + ')',
+    false,
+  )
 }
 
-function toTarget(value: string | BrowserTarget): BrowserTarget {
-  return typeof value === 'string' ? { selector: value } : value
+/**
+ * Perform one operation the page cannot perform itself.
+ * @param ctx - the mounted webview and its limits.
+ * @param request - the recorded request.
+ * @param deadline - the script's deadline.
+ * @returns the value the page's promise resolves with.
+ */
+async function serveRequest(ctx: ActionContext, request: PageScriptRequest, deadline: AbortSignal): Promise<unknown> {
+  if (request.method === 'screenshot') {
+    const options = (request.args[0] ?? {}) as { readonly fullPage?: boolean; readonly target?: unknown }
+    const outcome = await performAction({
+      kind: 'screenshot',
+      ...options.target === undefined ? {} : { target: toTarget(options.target) },
+      ...options.fullPage === true ? { fullPage: true } : {},
+    }, ctx, deadline)
+    if (outcome.image === undefined) throw new BrowserActionError('browser/screenshot-failed', 'the renderer produced no capture')
+    return outcome.image
+  }
+  if (request.method === 'click') {
+    const options = (request.args[1] ?? {}) as { readonly button?: 'left' | 'middle' | 'right'; readonly clickCount?: number; readonly modifiers?: readonly ('Alt' | 'Control' | 'Meta' | 'Shift')[] }
+    const outcome = await performAction({
+      kind: 'click',
+      target: toTarget(request.args[0]),
+      ...options.button === undefined ? {} : { button: options.button },
+      ...options.clickCount === undefined ? {} : { clickCount: options.clickCount },
+      ...options.modifiers === undefined ? {} : { modifiers: options.modifiers },
+    }, ctx, deadline)
+    return outcome.target
+  }
+  if (request.method === 'hover') {
+    const outcome = await performAction({ kind: 'hover', target: toTarget(request.args[0]) }, ctx, deadline)
+    return outcome.target
+  }
+  if (request.method === 'evaluate') {
+    return await ctx.webview.executeJavaScript(String(request.args[0]), false)
+  }
+  throw new BrowserActionError('browser/script-failed', 'the page asked for an unsupported operation: ' + request.method)
 }
 
-function createFacade(ctx: ActionContext, deadline: AbortSignal): BrowserPageFacade {
-  const webview = ctx.webview
-  // A managed script may navigate between its own calls, so every agent-backed
-  // method installs the agent first instead of assuming one is present.
-  const ask = async <T>(expression: string, userGesture: boolean): Promise<T> => {
-    await ensurePageAgent(webview)
-    return await callAgent<T>(webview, expression, userGesture)
-  }
-  return {
-    async goto(url, options) {
-      await performAction({ kind: 'navigate', direction: 'goto', url, ...options === undefined ? {} : { waitUntil: options.waitUntil } }, ctx, deadline)
-    },
-    url: () => webview.getURL(),
-    title: () => webview.getTitle(),
-    async reload() { await performAction({ kind: 'navigate', direction: 'reload' }, ctx, deadline) },
-    async goBack() { await performAction({ kind: 'navigate', direction: 'back' }, ctx, deadline) },
-    async goForward() { await performAction({ kind: 'navigate', direction: 'forward' }, ctx, deadline) },
-    async waitForSelector(selector, options) {
-      const deadlineAt = Date.now() + (options?.timeoutMs ?? 10_000)
-      let last: BrowserActionError | undefined
-      while (Date.now() < deadlineAt) {
-        deadline.throwIfAborted()
-        try {
-          return await ask<PageAgentElementInfo>(agentCall('resolve', { selector, exact: true }), false)
-        } catch (error) {
-          last = error instanceof BrowserActionError ? error : new BrowserActionError('browser/agent-failed', String(error))
-          if (last.code !== 'browser/target-missing') throw last
-        }
-        await delay(100, deadline)
-      }
-      throw last ?? new BrowserActionError('browser/timeout', 'no element matched ' + JSON.stringify(selector))
-    },
-    async waitForTimeout(ms) { await delay(Math.max(0, Math.min(ms, 60_000)), deadline) },
-    async querySelector(selector) {
-      const found = await ask<readonly PageAgentElementInfo[]>(agentCall('queryAll', selector, 1), false)
-      return found[0] ?? null
-    },
-    async querySelectorAll(selector) {
-      return await ask<readonly PageAgentElementInfo[]>(agentCall('queryAll', selector, 200), false)
-    },
-    async click(target) {
-      const outcome = await performAction({ kind: 'click', target: toTarget(target) }, ctx, deadline)
-      return requireTarget(outcome.target)
-    },
-    async fill(target, text) {
-      const outcome = await performAction({ kind: 'type', target: toTarget(target), text, mode: 'fill' }, ctx, deadline)
-      return outcome.target
-    },
-    async type(target, text) {
-      const outcome = await performAction({ kind: 'type', target: toTarget(target), text, mode: 'type' }, ctx, deadline)
-      return outcome.target
-    },
-    async hover(target) {
-      const outcome = await performAction({ kind: 'hover', target: toTarget(target) }, ctx, deadline)
-      return requireTarget(outcome.target)
-    },
-    async dragTo(source, target) {
-      await performAction({ kind: 'drag', source: toTarget(source), target: toTarget(target) }, ctx, deadline)
-    },
-    async textContent(target) {
-      const options: Record<string, unknown> = { mode: 'text', cursor: 0, limit: ctx.limits.maxReadChars }
-      if (target !== undefined) options.target = toTarget(target)
-      const read = await ask<PageAgentRead>(agentCall('read', options), false)
-      return read.content
-    },
-    async evaluate(input, arg) {
-      const source = typeof input === 'function'
-        ? '(' + input.toString() + ')(' + JSON.stringify(arg ?? null) + ')'
-        : '(' + input + ')'
-      return await webview.executeJavaScript(source, false)
-    },
-    async screenshot(options) {
-      const outcome = await performAction({ kind: 'screenshot', ...options?.fullPage === true ? { fullPage: true } : {} }, ctx, deadline)
-      if (outcome.image === undefined) throw new BrowserActionError('browser/screenshot-failed', 'the renderer produced no capture')
-      return outcome.image
-    },
-  }
+/**
+ * A bare selector string stands for a selector target, as the tools accept it.
+ * @param value - the target the page passed.
+ * @returns a target the actions resolve.
+ */
+function toTarget(value: unknown): BrowserTarget {
+  return typeof value === 'string' ? { selector: value } : value as BrowserTarget
 }
 
-function requireTarget(target: BrowserElementInfo | undefined): BrowserElementInfo {
-  if (target === undefined) throw new BrowserActionError('browser/agent-failed', 'the page agent returned no element')
-  return target
+/**
+ * Read the console output the page buffered.
+ * @param webview - the mounted webview.
+ * @returns the captured lines.
+ */
+async function readLogs(webview: WebviewElement): Promise<readonly string[]> {
+  const raw = await webview.executeJavaScript('globalThis.__dshBrowserScript.takeLogs()', false)
+  return Array.isArray(raw) ? raw as readonly string[] : []
 }

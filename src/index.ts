@@ -1,5 +1,5 @@
 /**
- * Host half of the dsh-browser plugin: ten browser tools over the desktop
+ * Host half of the dsh-browser plugin: twelve browser tools over the desktop
  * application's built-in Browser tab, driven by its renderer.
  * @module dsh-browser
  */
@@ -7,7 +7,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { BrowserConfigSchema, resolveBrowserConfig, type BrowserConfig } from './host/config.ts'
@@ -31,7 +30,7 @@ export const name = 'dsh-browser'
  * The browser routes ride the shared `/api` channel through
  * `ctx.connection.fetch.register()`, which needs no web-server service.
  */
-export const inject = ['tools', 'systemPrompt', 'connection', 'attachments', 'sandboxPolicy']
+export const inject = ['tools', 'systemPrompt', 'connection', 'attachments']
 
 /**
  * Mount the browser tools, their workflow guidance, and the Client command channel.
